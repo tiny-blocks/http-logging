@@ -10,6 +10,8 @@ use Psr\Http\Server\MiddlewareInterface;
 use Psr\Http\Server\RequestHandlerInterface;
 use Psr\Log\LoggerInterface;
 use TinyBlocks\Http\CorrelationId\CorrelatedLogger;
+use TinyBlocks\Http\CorrelationId\CorrelationId;
+use TinyBlocks\Http\CorrelationId\CorrelationIdMiddleware;
 use TinyBlocks\Http\Logging\Internal\LogExchange;
 use TinyBlocks\Time\MonotonicClock;
 
@@ -19,7 +21,7 @@ use TinyBlocks\Time\MonotonicClock;
  */
 final readonly class LogMiddleware implements MiddlewareInterface
 {
-    private function __construct(private MonotonicClock $clock, private CorrelatedLogger $correlatedLogger)
+    private function __construct(private MonotonicClock $clock, private LoggerInterface $logger)
     {
     }
 
@@ -32,7 +34,7 @@ final readonly class LogMiddleware implements MiddlewareInterface
      */
     public static function build(MonotonicClock $clock, LoggerInterface $logger): LogMiddleware
     {
-        return new LogMiddleware(clock: $clock, correlatedLogger: CorrelatedLogger::from(logger: $logger));
+        return new LogMiddleware(clock: $clock, logger: $logger);
     }
 
     /**
@@ -47,11 +49,12 @@ final readonly class LogMiddleware implements MiddlewareInterface
 
     public function process(ServerRequestInterface $request, RequestHandlerInterface $handler): ResponseInterface
     {
-        $exchange = LogExchange::start(
-            clock: $this->clock,
-            logger: $this->correlatedLogger->resolve(request: $request),
-            request: $request
-        );
+        $correlationId = $request->getAttribute(CorrelationIdMiddleware::ATTRIBUTE_NAME);
+        $logger = $correlationId instanceof CorrelationId
+            ? CorrelatedLogger::from(logger: $this->logger, correlationId: $correlationId)
+            : $this->logger;
+
+        $exchange = LogExchange::start(clock: $this->clock, logger: $logger, request: $request);
 
         $response = $handler->handle($request);
 
