@@ -6,6 +6,7 @@ namespace Test\TinyBlocks\Http\Logging\Unit;
 
 use GuzzleHttp\Psr7\Response;
 use GuzzleHttp\Psr7\ServerRequest;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
 use TinyBlocks\Http\CorrelationId\CorrelationId;
@@ -482,6 +483,37 @@ final class LogMiddlewareTest extends TestCase
         $builder->build();
     }
 
+    #[DataProvider('anyStatusDataProvider')]
+    public function testIgnoredPathWhenProcessedThenNothingIsLogged(int $statusCode): void
+    {
+        /** @Given a health check request */
+        $request = new ServerRequest('GET', '/health/readiness');
+
+        /** @And a response with the status code of the data set */
+        $response = new Response($statusCode);
+
+        /** @And a handler that answers with that response */
+        $handler = new CapturingHandler(response: $response);
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a middleware that never logs the health check paths */
+        $middleware = LogMiddleware::create()
+            ->withLogger(logger: $logger)
+            ->withIgnoredPaths('/health/liveness', '/health/readiness')
+            ->build();
+
+        /** @When the middleware processes the request */
+        $actual = $middleware->process($request, $handler);
+
+        /** @Then no entry is written */
+        self::assertSame([], $logger->entries());
+
+        /** @And the response of the handler is returned unchanged */
+        self::assertSame($response, $actual);
+    }
+
     public function testLogsWithBaseLoggerWhenCorrelationIdIsAbsent(): void
     {
         /** @Given a request without a correlation ID attribute */
@@ -598,6 +630,311 @@ final class LogMiddlewareTest extends TestCase
         self::assertSame($bodyContent, $actual->getBody()->__toString());
     }
 
+    public function testBuilderWhenNoPathsAreGivenThenEveryExchangeIsLogged(): void
+    {
+        /** @Given a health check request */
+        $request = new ServerRequest('GET', '/health/readiness');
+
+        /** @And a handler that returns a successful response */
+        $handler = new CapturingHandler(response: new Response(200));
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a middleware whose path filters were given no paths */
+        $middleware = LogMiddleware::create()
+            ->withLogger(logger: $logger)
+            ->withIgnoredPaths()
+            ->withFailureOnlyPaths()
+            ->build();
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then the request entry and the response entry are both written */
+        self::assertSame(['request', 'response'], array_column($logger->entries(), 'message'));
+    }
+
+    public function testPathInBothListsWhenResponseFailsThenNothingIsLogged(): void
+    {
+        /** @Given a health check request */
+        $request = new ServerRequest('GET', '/health/readiness');
+
+        /** @And a handler that returns a 503 response */
+        $handler = new CapturingHandler(response: new Response(503));
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a middleware that lists the same path as ignored and as failure-only */
+        $middleware = LogMiddleware::create()
+            ->withLogger(logger: $logger)
+            ->withIgnoredPaths('/health/readiness')
+            ->withFailureOnlyPaths('/health/readiness')
+            ->build();
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then no entry is written, since ignoring the path takes precedence */
+        self::assertSame([], $logger->entries());
+    }
+
+    #[DataProvider('nonErrorStatusDataProvider')]
+    public function testFailureOnlyPathWhenResponseSucceedsThenNothingIsLogged(int $statusCode): void
+    {
+        /** @Given a request to a periodic sweep route */
+        $request = new ServerRequest('POST', '/v1/outbox/dispatches');
+
+        /** @And a handler that answers with the status code of the data set, outside the error range */
+        $handler = new CapturingHandler(response: new Response($statusCode));
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a middleware that logs the sweep route only when it fails */
+        $middleware = LogMiddleware::create()
+            ->withLogger(logger: $logger)
+            ->withFailureOnlyPaths('/v1/outbox/dispatches')
+            ->build();
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then no entry is written */
+        self::assertSame([], $logger->entries());
+    }
+
+    public function testFailureOnlyPathWhenCorrelationIdIsPresentThenEntriesCarryIt(): void
+    {
+        /** @Given a correlation ID */
+        $correlationId = $this->createStub(CorrelationId::class);
+        $correlationId->method('toString')->willReturn('req-abc-123');
+
+        /** @And a request to a periodic sweep route carrying the correlation ID */
+        $request = new ServerRequest('POST', '/v1/outbox/dispatches')
+            ->withAttribute('correlationId', $correlationId);
+
+        /** @And a handler that returns a 500 response */
+        $handler = new CapturingHandler(response: new Response(500));
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a middleware with a deterministic clock that logs the sweep route only when it fails */
+        $middleware = LogMiddleware::create()
+            ->withClock(clock: new ClockFake(initial: 0, increment: 2_000_000))
+            ->withLogger(logger: $logger)
+            ->withFailureOnlyPaths('/v1/outbox/dispatches')
+            ->build();
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then the request entry and the response entry both carry the correlation ID */
+        self::assertSame(
+            [
+                [
+                    'level'   => 'info',
+                    'message' => 'request',
+                    'context' => [
+                        'method'         => 'POST',
+                        'uri'            => '/v1/outbox/dispatches',
+                        'correlation_id' => 'req-abc-123'
+                    ]
+                ],
+                [
+                    'level'   => 'error',
+                    'message' => 'response',
+                    'context' => [
+                        'method'         => 'POST',
+                        'uri'            => '/v1/outbox/dispatches',
+                        'status_code'    => 500,
+                        'duration_ms'    => 2.0,
+                        'correlation_id' => 'req-abc-123'
+                    ]
+                ]
+            ],
+            $logger->entries()
+        );
+    }
+
+    public function testBuildWhenOnlyClockAndLoggerAreGivenThenEveryExchangeIsLogged(): void
+    {
+        /** @Given a health check request */
+        $request = new ServerRequest('GET', '/health/readiness');
+
+        /** @And a handler that returns a successful response */
+        $handler = new CapturingHandler(response: new Response(200));
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a middleware built from a clock and a logger only, as before path filters existed */
+        $middleware = LogMiddleware::build(clock: new ClockFake(initial: 0, increment: 2_000_000), logger: $logger);
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then the request entry and the response entry are both written */
+        self::assertSame(['request', 'response'], array_column($logger->entries(), 'message'));
+    }
+
+    #[DataProvider('partialMatchDataProvider')]
+    public function testIgnoredPathsWhenPathOnlyPartiallyMatchesThenExchangeIsLogged(string $path): void
+    {
+        /** @Given a request whose path only partially matches the ignored path */
+        $request = new ServerRequest('GET', $path);
+
+        /** @And a handler that returns a successful response */
+        $handler = new CapturingHandler(response: new Response(200));
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a middleware that never logs the readiness path */
+        $middleware = LogMiddleware::create()
+            ->withLogger(logger: $logger)
+            ->withIgnoredPaths('/health/readiness')
+            ->build();
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then the request entry and the response entry are both written */
+        self::assertSame(['request', 'response'], array_column($logger->entries(), 'message'));
+    }
+
+    #[DataProvider('statusAndLevelDataProvider')]
+    public function testUnlistedPathWhenPathsAreConfiguredThenExchangeIsLoggedAsBefore(
+        int $statusCode,
+        string $level
+    ): void {
+        /** @Given a request to a route that no path filter lists */
+        $request = new ServerRequest('GET', '/v1/orders');
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a handler that writes its own entry and answers with the status code of the data set */
+        $handler = new LoggingHandler(logger: $logger, response: new Response($statusCode));
+
+        /** @And a middleware with a deterministic clock, an ignored path, and a failure-only path */
+        $middleware = LogMiddleware::create()
+            ->withClock(clock: new ClockFake(initial: 0, increment: 2_000_000))
+            ->withLogger(logger: $logger)
+            ->withIgnoredPaths('/health/readiness')
+            ->withFailureOnlyPaths('/v1/outbox/dispatches')
+            ->build();
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then the request entry precedes the handler and the response entry follows it at the expected level */
+        self::assertSame(
+            [
+                [
+                    'level'   => 'info',
+                    'message' => 'request',
+                    'context' => ['method' => 'GET', 'uri' => '/v1/orders']
+                ],
+                [
+                    'level'   => 'info',
+                    'message' => 'handled',
+                    'context' => []
+                ],
+                [
+                    'level'   => $level,
+                    'message' => 'response',
+                    'context' => [
+                        'method'      => 'GET',
+                        'uri'         => '/v1/orders',
+                        'status_code' => $statusCode,
+                        'duration_ms' => 2.0
+                    ]
+                ]
+            ],
+            $logger->entries()
+        );
+    }
+
+    #[DataProvider('errorStatusDataProvider')]
+    public function testFailureOnlyPathWhenResponseFailsThenRequestAndResponseAreLogged(int $statusCode): void
+    {
+        /** @Given a request to a periodic sweep route carrying query parameters and a body */
+        $request = new ServerRequest('POST', '/v1/outbox/dispatches?batch=10')
+            ->withQueryParams(['batch' => '10'])
+            ->withParsedBody(['cycle' => 'weekly']);
+
+        /** @And a handler that answers with the error status code of the data set and a JSON body */
+        $handler = new CapturingHandler(response: new Response($statusCode, [], '{"reason":"dispatch failed"}'));
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a middleware with a deterministic clock that logs the sweep route only when it fails */
+        $middleware = LogMiddleware::create()
+            ->withClock(clock: new ClockFake(initial: 0, increment: 2_000_000))
+            ->withLogger(logger: $logger)
+            ->withFailureOnlyPaths('/v1/outbox/dispatches')
+            ->build();
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then the request entry and the response entry are written with the context any other path gets */
+        self::assertSame(
+            [
+                [
+                    'level'   => 'info',
+                    'message' => 'request',
+                    'context' => [
+                        'method'           => 'POST',
+                        'uri'              => '/v1/outbox/dispatches?batch=10',
+                        'query_parameters' => ['batch' => '10'],
+                        'body'             => ['cycle' => 'weekly']
+                    ]
+                ],
+                [
+                    'level'   => 'error',
+                    'message' => 'response',
+                    'context' => [
+                        'method'      => 'POST',
+                        'uri'         => '/v1/outbox/dispatches?batch=10',
+                        'status_code' => $statusCode,
+                        'duration_ms' => 2.0,
+                        'body'        => ['reason' => 'dispatch failed']
+                    ]
+                ]
+            ],
+            $logger->entries()
+        );
+    }
+
+    public function testFailureOnlyPathWhenResponseFailsThenRequestIsLoggedAfterHandler(): void
+    {
+        /** @Given a request to a periodic sweep route */
+        $request = new ServerRequest('POST', '/v1/outbox/dispatches');
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a handler that writes its own entry and returns a 500 response */
+        $handler = new LoggingHandler(logger: $logger, response: new Response(500));
+
+        /** @And a middleware that logs the sweep route only when it fails */
+        $middleware = LogMiddleware::create()
+            ->withLogger(logger: $logger)
+            ->withFailureOnlyPaths('/v1/outbox/dispatches')
+            ->build();
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then the request entry follows the entry of the handler and precedes the response entry */
+        self::assertSame(['handled', 'request', 'response'], array_column($logger->entries(), 'message'));
+    }
+
     public function testLogsResponseContextAlwaysContainsMethodUriStatusCodeAndDuration(): void
     {
         /** @Given a PATCH request */
@@ -629,5 +966,80 @@ final class LogMiddlewareTest extends TestCase
         self::assertSame('/items/7', $capturedContext['uri']);
         self::assertSame(200, $capturedContext['status_code']);
         self::assertArrayHasKey('duration_ms', $capturedContext);
+    }
+
+    #[DataProvider('partialMatchDataProvider')]
+    public function testFailureOnlyPathsWhenPathOnlyPartiallyMatchesThenExchangeIsLogged(string $path): void
+    {
+        /** @Given a request whose path only partially matches the failure-only path */
+        $request = new ServerRequest('GET', $path);
+
+        /** @And a handler that returns a successful response */
+        $handler = new CapturingHandler(response: new Response(200));
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a middleware that logs the readiness path only when it fails */
+        $middleware = LogMiddleware::create()
+            ->withLogger(logger: $logger)
+            ->withFailureOnlyPaths('/health/readiness')
+            ->build();
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then the request entry and the response entry are both written */
+        self::assertSame(['request', 'response'], array_column($logger->entries(), 'message'));
+    }
+
+    public static function anyStatusDataProvider(): array
+    {
+        return [
+            'OK'                  => [200],
+            'No content'          => [204],
+            'Not found'           => [404],
+            'Service unavailable' => [503]
+        ];
+    }
+
+    public static function errorStatusDataProvider(): array
+    {
+        return [
+            'Bad request'           => [400],
+            'Not found'             => [404],
+            'Unprocessable entity'  => [422],
+            'Internal server error' => [500],
+            'Service unavailable'   => [503]
+        ];
+    }
+
+    public static function partialMatchDataProvider(): array
+    {
+        return [
+            'Prefix of the listed path'          => ['/health'],
+            'Suffix of the listed path'          => ['/readiness'],
+            'Listed path with a trailing slash'  => ['/health/readiness/'],
+            'Listed path followed by a segment'  => ['/health/readiness/details'],
+            'Listed path in another letter case' => ['/HEALTH/READINESS']
+        ];
+    }
+
+    public static function nonErrorStatusDataProvider(): array
+    {
+        return [
+            'OK'         => [200],
+            'Created'    => [201],
+            'No content' => [204],
+            'Found'      => [302]
+        ];
+    }
+
+    public static function statusAndLevelDataProvider(): array
+    {
+        return [
+            'Successful response' => [200, 'info'],
+            'Server error'        => [500, 'error']
+        ];
     }
 }

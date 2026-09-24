@@ -13,6 +13,10 @@ parameters:
         # log payload (decoded body) cannot be expressed there.
         - identifier: missingType.iterableValue
           path: src/Internal/LogResponse.php
+        # PHPDoc is prohibited inside src/Internal/; the path lookup keyed by path cannot
+        # carry its value type there.
+        - identifier: missingType.iterableValue
+          path: src/Internal/Paths.php
         # The request context returned by LogRequest::toContext() is typed as `array`, so
         # PHPStan cannot infer the shape consumed by the LogResponse factory.
         - identifier: argument.type
@@ -21,4 +25,10 @@ parameters:
         # value type, so PHPStan flags offset access on the assertions.
         - identifier: offsetAccess.nonOffsetAccessible
           path: tests/Unit/LogMiddlewareTest.php
+        # PHPDoc is prohibited inside tests/; the captured log entries and the data sets
+        # cannot carry a value type.
+        - identifier: missingType.iterableValue
+          paths:
+              - tests/Unit/CapturingLogger.php
+              - tests/Unit/LogMiddlewareTest.php
     reportUnmatchedIgnoredErrors: true

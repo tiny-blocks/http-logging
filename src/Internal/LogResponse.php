@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace TinyBlocks\Http\Logging\Internal;
 
 use Psr\Http\Message\ResponseInterface;
+use Psr\Log\LoggerInterface;
 use TinyBlocks\Http\Code;
 use TinyBlocks\Time\Elapsed;
 
@@ -38,7 +39,15 @@ final readonly class LogResponse
         return Code::isErrorCode(code: $this->statusCode);
     }
 
-    public function toContext(): array
+    public function writeTo(LoggerInterface $logger): void
+    {
+        match ($this->isError()) {
+            true  => $logger->error('response', $this->toContext()),
+            false => $logger->info('response', $this->toContext())
+        };
+    }
+
+    private function toContext(): array
     {
         $context = [
             'method'      => $this->method,
