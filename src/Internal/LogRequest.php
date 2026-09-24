@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace TinyBlocks\Http\Logging\Internal;
 
 use Psr\Http\Message\ServerRequestInterface;
+use Psr\Log\LoggerInterface;
 use TinyBlocks\Http\Server\Request;
 
 final readonly class LogRequest
@@ -29,6 +30,11 @@ final readonly class LogRequest
             method: $typedRequest->method()->value,
             queryParameters: $uri->queryParameters()->toArray()
         );
+    }
+
+    public function writeTo(LoggerInterface $logger): void
+    {
+        $logger->info('request', $this->toContext());
     }
 
     public function toContext(): array

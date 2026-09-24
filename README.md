@@ -8,6 +8,8 @@
     + [Wiring the middleware](#wiring-the-middleware)
     + [Correlated logs](#correlated-logs)
     + [Customizing the clock](#customizing-the-clock)
+    + [Ignoring paths](#ignoring-paths)
+    + [Logging paths only on failure](#logging-paths-only-on-failure)
 * [License](#license)
 * [Contributing](#contributing)
 
@@ -16,7 +18,9 @@
 Provides a PSR-15 middleware that records every inbound HTTP exchange. Before invoking the next handler, the
 middleware logs the request method, URI, query parameters, and parsed body. After the handler runs, it logs the
 response status code, decoded JSON body when present, and the elapsed duration in milliseconds. Successful
-responses are logged at `info` level. Responses in the 4xx/5xx range are logged at `error` level.
+responses are logged at `info` level. Responses in the 4xx/5xx range are logged at `error` level. Chosen paths can be
+left out of the log entirely, or logged only when their response is an error, so health checks and routes called on
+a schedule do not bury the entries that matter.
 
 Duration is measured through a `TinyBlocks\Time\MonotonicClock` and a `Stopwatch`, so the reading is unaffected
 by wall-clock adjustments. When the request carries a correlation identifier (under the `correlationId`
@@ -112,6 +116,53 @@ $clock = new readonly class () implements MonotonicClock {
 $middleware = LogMiddleware::create()
     ->withClock(clock: $clock)
     ->withLogger(logger: $logger)
+    ->build();
+```
+
+### Ignoring paths
+
+Leaves the given paths out of the log entirely. Neither the `request` entry nor the `response` entry is written for
+them, whatever the response status, which suits health checks that a load balancer or an orchestrator polls every few
+seconds. Each path is compared by exact equality with the request URI path, so `/health` does not match
+`/health/readiness`, and the query string plays no part in the comparison.
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use TinyBlocks\Http\Logging\LogMiddleware;
+
+# Requests to the health check paths never produce a log entry, whether they succeed or fail.
+$middleware = LogMiddleware::create()
+    ->withLogger(logger: $logger)
+    ->withIgnoredPaths('/health/liveness', '/health/readiness')
+    ->build();
+```
+
+### Logging paths only on failure
+
+Logs the given paths only when their response is an error, meaning a status in the 4xx/5xx range. Any other response
+produces no entry. An error response produces both the `request` entry and the `response` entry, with the same context
+as on any other path, so the failure stays fully visible. This suits internal routes called on a schedule that almost
+always succeed with nothing to report. Each path is compared by exact equality with the request URI path.
+
+The outcome is known only once the handler returns, so on these paths the `request` entry is written after the handler
+runs instead of before it. A handler that throws instead of returning a response leaves no entry on these paths. A
+path that is also ignored is never logged.
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use TinyBlocks\Http\Logging\LogMiddleware;
+
+# Health checks are never logged, and the scheduled dispatch route is logged only when it fails.
+$middleware = LogMiddleware::create()
+    ->withLogger(logger: $logger)
+    ->withIgnoredPaths('/health/readiness')
+    ->withFailureOnlyPaths('/v1/outbox/dispatches')
     ->build();
 ```
 
