@@ -12,13 +12,13 @@ final readonly class LogRequest
 {
     private function __construct(
         private string $uri,
-        private ?array $body,
+        private array $body,
         private string $method,
         private array $queryParameters
     ) {
     }
 
-    public static function from(ServerRequestInterface $request): LogRequest
+    public static function from(ServerRequestInterface $request, BodyLimit $bodyLimit): LogRequest
     {
         $typedRequest = Request::from(request: $request);
         $decodedRequest = $typedRequest->decode();
@@ -26,7 +26,7 @@ final readonly class LogRequest
 
         return new LogRequest(
             uri: $uri->toString(),
-            body: $decodedRequest->body()->toArray(),
+            body: $bodyLimit->contextOf(body: $decodedRequest->body()->toArray()),
             method: $typedRequest->method()->value,
             queryParameters: $uri->queryParameters()->toArray()
         );
@@ -48,10 +48,6 @@ final readonly class LogRequest
             $context['query_parameters'] = $this->queryParameters;
         }
 
-        if (!empty($this->body)) {
-            $context['body'] = $this->body;
-        }
-
-        return $context;
+        return [...$context, ...$this->body];
     }
 }

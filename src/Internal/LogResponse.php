@@ -13,21 +13,25 @@ final readonly class LogResponse
 {
     private function __construct(
         private string $uri,
-        private ?array $body,
+        private array $body,
         private string $method,
         private Elapsed $elapsed,
         private int $statusCode
     ) {
     }
 
-    public static function from(Elapsed $elapsed, LogRequest $request, ResponseInterface $response): LogResponse
-    {
+    public static function from(
+        Elapsed $elapsed,
+        LogRequest $request,
+        ResponseInterface $response,
+        BodyLimit $bodyLimit
+    ): LogResponse {
         $context = $request->toContext();
         $decodedBody = json_decode($response->getBody()->__toString(), true);
 
         return new LogResponse(
             uri: $context['uri'],
-            body: is_array($decodedBody) ? $decodedBody : null,
+            body: $bodyLimit->contextOf(body: is_array($decodedBody) ? $decodedBody : null),
             method: $context['method'],
             elapsed: $elapsed,
             statusCode: $response->getStatusCode()
@@ -56,10 +60,6 @@ final readonly class LogResponse
             'duration_ms' => $this->elapsed->toMilliseconds()
         ];
 
-        if (!empty($this->body)) {
-            $context['body'] = $this->body;
-        }
-
-        return $context;
+        return [...$context, ...$this->body];
     }
 }
