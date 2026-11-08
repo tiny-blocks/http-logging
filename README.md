@@ -10,6 +10,7 @@
     + [Customizing the clock](#customizing-the-clock)
     + [Ignoring paths](#ignoring-paths)
     + [Logging paths only on failure](#logging-paths-only-on-failure)
+    + [Limiting logged bodies](#limiting-logged-bodies)
 * [License](#license)
 * [Contributing](#contributing)
 
@@ -20,7 +21,8 @@ middleware logs the request method, URI, query parameters, and parsed body. Afte
 response status code, decoded JSON body when present, and the elapsed duration in milliseconds. Successful
 responses are logged at `info` level. Responses in the 4xx/5xx range are logged at `error` level. Chosen paths can be
 left out of the log entirely, or logged only when their response is an error, so health checks and routes called on
-a schedule do not bury the entries that matter.
+a schedule do not bury the entries that matter. A body longer than 2048 bytes is logged as an excerpt that fits within
+that limit, so a single entry stays well under the line length a log driver accepts.
 
 Duration is measured through a `TinyBlocks\Time\MonotonicClock` and a `Stopwatch`, so the reading is unaffected
 by wall-clock adjustments. When the request carries a correlation identifier (under the `correlationId`
@@ -165,6 +167,51 @@ $middleware = LogMiddleware::create()
     ->withFailureOnlyPaths('/v1/outbox/dispatches')
     ->build();
 ```
+
+### Limiting logged bodies
+
+Caps the size of every request and response body written to the log. The size of a body is the length in bytes of its
+JSON encoding, written the way a JSON logger writes it (unescaped slashes and unescaped UTF-8). A body within the limit
+is logged whole. A longer body is logged as an excerpt that fits within the limit, and the entry gains
+`body_truncated_from_bytes`, the size of the whole body. Without `withBodyLimit` the limit is 2048 bytes.
+
+The excerpt is the body read in document order until the limit is reached:
+
+| Part of the body                   | In the excerpt                                     |
+|------------------------------------|----------------------------------------------------|
+| Fields and elements that fit       | Kept as they are, with their field names.          |
+| The string where the limit falls   | Cut on a whole UTF-8 character and ended with `…`. |
+| The object or array where it falls | Read the same way, one level down.                 |
+| Everything after the limit         | Left out.                                          |
+
+The excerpt stays a JSON object or array, never a string holding broken JSON, so the entry remains valid JSON and a
+logger that redacts fields by name, such as the redactions of
+[tiny-blocks/logger](https://github.com/tiny-blocks/logger), still finds and masks them in the excerpt.
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use TinyBlocks\Http\Logging\LogMiddleware;
+
+# Bodies up to 4096 bytes are logged whole. A longer body is logged as an excerpt of at most 4096 bytes.
+$middleware = LogMiddleware::create()
+    ->withLogger(logger: $logger)
+    ->withBodyLimit(bytes: 4096)
+    ->build();
+
+# A response body of 18342 bytes is then logged as, for example:
+# "body":{"version":"3","text":"Ao aceitar estes termos…"},"body_truncated_from_bytes":18342
+```
+
+A limit of zero logs the size of every body and none of its content. A negative limit raises `BodyLimitOutOfRange`
+when the middleware is built.
+
+The default leaves room for the rest of the entry. Docker's `awslogs` driver splits a line longer than 16 KB into
+fragments that are no longer valid JSON, and an entry carries one body next to the method, the URI, the query
+parameters and the correlation identifier. 2048 bytes keeps the whole entry well under that line length, even when a
+logger escapes every non-ASCII character and the body triples in size.
 
 ## License
 

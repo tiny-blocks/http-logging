@@ -10,6 +10,7 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
 use TinyBlocks\Http\CorrelationId\CorrelationId;
+use TinyBlocks\Http\Logging\Exceptions\BodyLimitOutOfRange;
 use TinyBlocks\Http\Logging\Exceptions\LoggerNotConfigured;
 use TinyBlocks\Http\Logging\LogMiddleware;
 
@@ -539,6 +540,41 @@ final class LogMiddlewareTest extends TestCase
         /** @Then the base logger should have been used directly (verified by mock expectations) */
     }
 
+    public function testBodyLimitWhenZeroThenOnlyTheBodySizeIsLogged(): void
+    {
+        /** @Given a GET request */
+        $request = new ServerRequest('GET', '/documents/1');
+
+        /** @And a handler that returns a response whose JSON body is 8 bytes long */
+        $handler = new CapturingHandler(response: new Response(200, [], '{"id":1}'));
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a middleware with a deterministic clock whose body limit is zero */
+        $middleware = LogMiddleware::create()
+            ->withClock(clock: new ClockFake(initial: 0, increment: 2_000_000))
+            ->withLogger(logger: $logger)
+            ->withBodyLimit(bytes: 0)
+            ->build();
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then the response entry keeps no part of the body and carries the size of the whole body */
+        self::assertSame(
+            [
+                'method'                    => 'GET',
+                'uri'                       => '/documents/1',
+                'status_code'               => 200,
+                'duration_ms'               => 2.0,
+                'body'                      => [],
+                'body_truncated_from_bytes' => 8
+            ],
+            $logger->entries()[1]['context']
+        );
+    }
+
     public function testLogsRequestContextAlwaysContainsMethodAndUri(): void
     {
         /** @Given a PUT request to a specific URI */
@@ -568,6 +604,77 @@ final class LogMiddlewareTest extends TestCase
         /** @Then the context should always contain method and uri */
         self::assertSame('PUT', $capturedContext['method']);
         self::assertSame('/orders/42', $capturedContext['uri']);
+    }
+
+    public function testResponseBodyWhenAtDefaultLimitThenLoggedWhole(): void
+    {
+        /** @Given a GET request */
+        $request = new ServerRequest('GET', '/documents/1');
+
+        /** @And a handler that returns a response whose JSON body is 2048 bytes long, the default limit */
+        $handler = new CapturingHandler(
+            response: new Response(200, [], (string) json_encode(['text' => str_repeat('a', 2037)]))
+        );
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a middleware with a deterministic clock and the default body limit */
+        $middleware = LogMiddleware::create()
+            ->withClock(clock: new ClockFake(initial: 0, increment: 2_000_000))
+            ->withLogger(logger: $logger)
+            ->build();
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then the response entry carries the whole body and no truncation marker */
+        self::assertSame(
+            [
+                'method'      => 'GET',
+                'uri'         => '/documents/1',
+                'status_code' => 200,
+                'duration_ms' => 2.0,
+                'body'        => ['text' => str_repeat('a', 2037)]
+            ],
+            $logger->entries()[1]['context']
+        );
+    }
+
+    public function testResponseBodyWhenExactlyAtLimitThenLoggedWhole(): void
+    {
+        /** @Given a GET request */
+        $request = new ServerRequest('GET', '/documents/1');
+
+        /** @And a handler that returns a response whose JSON body is 44 bytes long */
+        $handler = new CapturingHandler(
+            response: new Response(200, [], '{"id":7,"text":"abcdefghijklmnopqrstuvwxyz"}')
+        );
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a middleware with a deterministic clock whose body limit is 44 bytes */
+        $middleware = LogMiddleware::create()
+            ->withClock(clock: new ClockFake(initial: 0, increment: 2_000_000))
+            ->withLogger(logger: $logger)
+            ->withBodyLimit(bytes: 44)
+            ->build();
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then the response entry carries the whole body and no truncation marker */
+        self::assertSame(
+            [
+                'method'      => 'GET',
+                'uri'         => '/documents/1',
+                'status_code' => 200,
+                'duration_ms' => 2.0,
+                'body'        => ['id' => 7, 'text' => 'abcdefghijklmnopqrstuvwxyz']
+            ],
+            $logger->entries()[1]['context']
+        );
     }
 
     public function testDurationIsComputedWithTwoDecimalPlacePrecision(): void
@@ -606,6 +713,39 @@ final class LogMiddlewareTest extends TestCase
         self::assertSame(1.27, $capturedContext['duration_ms']);
     }
 
+    public function testRequestBodyWhenOverLimitThenTruncatedWithItsSize(): void
+    {
+        /** @Given a POST request whose parsed body is 37 bytes long once encoded */
+        $request = new ServerRequest('POST', '/notes')
+            ->withParsedBody(['note' => 'abcdefghijklmnopqrstuvwxyz']);
+
+        /** @And a handler that returns a 201 response */
+        $handler = new CapturingHandler(response: new Response(201));
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a middleware whose body limit is 20 bytes */
+        $middleware = LogMiddleware::create()
+            ->withLogger(logger: $logger)
+            ->withBodyLimit(bytes: 20)
+            ->build();
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then the request entry carries an excerpt within 20 bytes and the size of the whole body */
+        self::assertSame(
+            [
+                'method'                    => 'POST',
+                'uri'                       => '/notes',
+                'body'                      => ['note' => 'abcdef…'],
+                'body_truncated_from_bytes' => 37
+            ],
+            $logger->entries()[0]['context']
+        );
+    }
+
     public function testLogsResponseBodyStreamRemainsReadableAfterLogging(): void
     {
         /** @Given a GET request */
@@ -628,6 +768,21 @@ final class LogMiddlewareTest extends TestCase
 
         /** @Then the response body should still be fully readable after logging consumed it */
         self::assertSame($bodyContent, $actual->getBody()->__toString());
+    }
+
+    public function testBuildWhenBodyLimitIsNegativeThenBodyLimitOutOfRange(): void
+    {
+        /** @Given a builder configured with a logger and a negative body limit */
+        $builder = LogMiddleware::create()
+            ->withLogger(logger: new CapturingLogger())
+            ->withBodyLimit(bytes: -1);
+
+        /** @Then an exception indicating the body limit is out of range should be thrown */
+        $this->expectException(BodyLimitOutOfRange::class);
+        $this->expectExceptionMessage('Body limit must be zero or more bytes, got -1.');
+
+        /** @When building the middleware */
+        $builder->build();
     }
 
     public function testBuilderWhenNoPathsAreGivenThenEveryExchangeIsLogged(): void
@@ -680,6 +835,112 @@ final class LogMiddlewareTest extends TestCase
         self::assertSame([], $logger->entries());
     }
 
+    public function testRequestBodyWhenNotValidUtf8ThenLoggedWithoutFailing(): void
+    {
+        /** @Given a POST request whose parsed body holds bytes that are not valid UTF-8 */
+        $request = new ServerRequest('POST', '/notes')->withParsedBody(['note' => "\xB1\x31"]);
+
+        /** @And a handler that returns a 201 response */
+        $handler = new CapturingHandler(response: new Response(201));
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a middleware with the default body limit */
+        $middleware = LogMiddleware::create()->withLogger(logger: $logger)->build();
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then the request entry carries the body untouched */
+        self::assertSame(
+            ['method' => 'POST', 'uri' => '/notes', 'body' => ['note' => "\xB1\x31"]],
+            $logger->entries()[0]['context']
+        );
+    }
+
+    #[DataProvider('overLimitBodyDataProvider')]
+    public function testResponseBodyWhenOverLimitThenExcerptFitsWithinLimit(
+        int $limit,
+        array $body,
+        array $excerpt,
+        int $bytes
+    ): void {
+        /** @Given a GET request */
+        $request = new ServerRequest('GET', '/documents/1');
+
+        /** @And a handler that returns a response whose JSON body is longer than the limit of the data set */
+        $handler = new CapturingHandler(response: new Response(200, [], (string) json_encode($body)));
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a middleware with a deterministic clock and the body limit of the data set */
+        $middleware = LogMiddleware::create()
+            ->withClock(clock: new ClockFake(initial: 0, increment: 2_000_000))
+            ->withLogger(logger: $logger)
+            ->withBodyLimit(bytes: $limit)
+            ->build();
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then the response entry carries the excerpt of the data set and the size of the whole body */
+        self::assertSame(
+            [
+                'method'                    => 'GET',
+                'uri'                       => '/documents/1',
+                'status_code'               => 200,
+                'duration_ms'               => 2.0,
+                'body'                      => $excerpt,
+                'body_truncated_from_bytes' => $bytes
+            ],
+            $logger->entries()[1]['context']
+        );
+
+        /** @And the excerpt, encoded the way a JSON logger writes it, stays within the limit */
+        self::assertLessThanOrEqual(
+            $limit,
+            strlen((string) json_encode($excerpt, (JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)))
+        );
+    }
+
+    public function testResponseBodyWhenOneByteOverDefaultLimitThenTruncated(): void
+    {
+        /** @Given a GET request */
+        $request = new ServerRequest('GET', '/documents/1');
+
+        /** @And a handler that returns a response whose JSON body is 2049 bytes long, one over the default limit */
+        $handler = new CapturingHandler(
+            response: new Response(200, [], (string) json_encode(['text' => str_repeat('a', 2038)]))
+        );
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a middleware with a deterministic clock and the default body limit */
+        $middleware = LogMiddleware::create()
+            ->withClock(clock: new ClockFake(initial: 0, increment: 2_000_000))
+            ->withLogger(logger: $logger)
+            ->build();
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then the response entry carries an excerpt cut to 2048 bytes and the size of the whole body */
+        self::assertSame(
+            [
+                'method'                    => 'GET',
+                'uri'                       => '/documents/1',
+                'status_code'               => 200,
+                'duration_ms'               => 2.0,
+                'body'                      => ['text' => implode('', [str_repeat('a', 2034), '…'])],
+                'body_truncated_from_bytes' => 2049
+            ],
+            $logger->entries()[1]['context']
+        );
+    }
+
     #[DataProvider('nonErrorStatusDataProvider')]
     public function testFailureOnlyPathWhenResponseSucceedsThenNothingIsLogged(int $statusCode): void
     {
@@ -703,6 +964,43 @@ final class LogMiddlewareTest extends TestCase
 
         /** @Then no entry is written */
         self::assertSame([], $logger->entries());
+    }
+
+    public function testTruncatedBodyWhenLoggerRedactsFieldsThenExcerptIsRedacted(): void
+    {
+        /** @Given a GET request */
+        $request = new ServerRequest('GET', '/legal-acceptances/1');
+
+        /** @And a handler that returns a response with an email and a text, 64 bytes long in all */
+        $handler = new CapturingHandler(
+            response: new Response(200, [], '{"email":"john@example.com","text":"abcdefghijklmnopqrstuvwxyz"}')
+        );
+
+        /** @And a logger that masks every email field before writing the entry */
+        $logger = new RedactingLogger();
+
+        /** @And a middleware with a deterministic clock whose body limit is 50 bytes */
+        $middleware = LogMiddleware::create()
+            ->withClock(clock: new ClockFake(initial: 0, increment: 2_000_000))
+            ->withLogger(logger: $logger)
+            ->withBodyLimit(bytes: 50)
+            ->build();
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then the excerpt keeps its fields, so the email is masked by the logger and the text is cut */
+        self::assertSame(
+            [
+                'method'                    => 'GET',
+                'uri'                       => '/legal-acceptances/1',
+                'status_code'               => 200,
+                'duration_ms'               => 2.0,
+                'body'                      => ['email' => '***', 'text' => 'abcdefghi…'],
+                'body_truncated_from_bytes' => 64
+            ],
+            $logger->entries()[1]['context']
+        );
     }
 
     public function testFailureOnlyPathWhenCorrelationIdIsPresentThenEntriesCarryIt(): void
@@ -1022,6 +1320,84 @@ final class LogMiddlewareTest extends TestCase
             'Listed path with a trailing slash'  => ['/health/readiness/'],
             'Listed path followed by a segment'  => ['/health/readiness/details'],
             'Listed path in another letter case' => ['/HEALTH/READINESS']
+        ];
+    }
+
+    public static function overLimitBodyDataProvider(): array
+    {
+        return [
+            'String cut after a field that fits'            => [
+                'limit'   => 30,
+                'body'    => ['id' => 7, 'text' => 'abcdefghijklmnopqrstuvwxyz'],
+                'excerpt' => ['id' => 7, 'text' => 'abcdefghi…'],
+                'bytes'   => 44
+            ],
+            'List element that fits exactly'                => [
+                'limit'   => 17,
+                'body'    => [1000000, 2000000, 3000000],
+                'excerpt' => [1000000, 2000000],
+                'bytes'   => 25
+            ],
+            'Number that does not fit'                      => [
+                'limit'   => 23,
+                'body'    => [1000000, 2000000, 3000000],
+                'excerpt' => [1000000, 2000000],
+                'bytes'   => 25
+            ],
+            'Nested object cut inside'                      => [
+                'limit'   => 25,
+                'body'    => ['data' => ['name' => 'abcdefghij']],
+                'excerpt' => ['data' => ['name' => 'ab…']],
+                'bytes'   => 30
+            ],
+            'Nested object with room for its brackets only' => [
+                'limit'   => 18,
+                'body'    => ['a' => 'xyz', 'b' => ['c' => 'd']],
+                'excerpt' => ['a' => 'xyz', 'b' => []],
+                'bytes'   => 25
+            ],
+            'String with room for the ellipsis only'        => [
+                'limit'   => 21,
+                'body'    => ['a' => 'xyz', 'b' => 'long text'],
+                'excerpt' => ['a' => 'xyz', 'b' => '…'],
+                'bytes'   => 27
+            ],
+            'String without room for the ellipsis'          => [
+                'limit'   => 20,
+                'body'    => ['a' => 'xyz', 'b' => 'long text'],
+                'excerpt' => ['a' => 'xyz'],
+                'bytes'   => 27
+            ],
+            'Numeric keys counted as quoted names'          => [
+                'limit'   => 22,
+                'body'    => ['10' => 'abcdef', '20' => 'ghijkl'],
+                'excerpt' => [10 => 'abcdef'],
+                'bytes'   => 29
+            ],
+            'Two-byte character kept whole'                 => [
+                'limit'   => 18,
+                'body'    => ['text' => 'aaéaaaa'],
+                'excerpt' => ['text' => 'aaé…'],
+                'bytes'   => 19
+            ],
+            'Two-byte character left out whole'             => [
+                'limit'   => 17,
+                'body'    => ['text' => 'aaéaaaa'],
+                'excerpt' => ['text' => 'aa…'],
+                'bytes'   => 19
+            ],
+            'Four-byte character left out whole'            => [
+                'limit'   => 19,
+                'body'    => ['text' => 'ab😀cdef'],
+                'excerpt' => ['text' => 'ab…'],
+                'bytes'   => 21
+            ],
+            'Escaped characters counted at encoded size'    => [
+                'limit'   => 18,
+                'body'    => ['text' => '"q"rstuvwxyz'],
+                'excerpt' => ['text' => '"q…'],
+                'bytes'   => 25
+            ]
         ];
     }
 

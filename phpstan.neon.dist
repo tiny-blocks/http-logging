@@ -17,6 +17,10 @@ parameters:
         # carry its value type there.
         - identifier: missingType.iterableValue
           path: src/Internal/Paths.php
+        # PHPDoc is prohibited inside src/Internal/; the decoded body and the excerpt cut
+        # from it are arbitrary JSON values, so their iterable value types cannot be expressed.
+        - identifier: missingType.iterableValue
+          path: src/Internal/BodyLimit.php
         # The request context returned by LogRequest::toContext() is typed as `array`, so
         # PHPStan cannot infer the shape consumed by the LogResponse factory.
         - identifier: argument.type
@@ -31,4 +35,5 @@ parameters:
           paths:
               - tests/Unit/CapturingLogger.php
               - tests/Unit/LogMiddlewareTest.php
+              - tests/Unit/RedactingLogger.php
     reportUnmatchedIgnoredErrors: true
