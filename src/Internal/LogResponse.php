@@ -45,9 +45,10 @@ final readonly class LogResponse
 
     public function writeTo(LoggerInterface $logger): void
     {
-        match ($this->isError()) {
-            true  => $logger->error('response', $this->toContext()),
-            false => $logger->info('response', $this->toContext())
+        match (true) {
+            !$this->isError()                                      => $logger->info('response', $this->toContext()),
+            $this->statusCode < Code::INTERNAL_SERVER_ERROR->value => $logger->warning('response', $this->toContext()),
+            default                                                => $logger->error('response', $this->toContext())
         };
     }
 

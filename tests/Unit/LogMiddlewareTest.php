@@ -366,42 +366,6 @@ final class LogMiddlewareTest extends TestCase
         /** @Then the correlation ID is present in each log call context (verified by mock expectations) */
     }
 
-    public function testLogsErrorLevelOnClientErrorResponse(): void
-    {
-        /** @Given a POST request */
-        $request = new ServerRequest('POST', '/users');
-
-        /** @And a handler that returns a 422 response */
-        $handler = new CapturingHandler(
-            response: new Response(422, [], '{"error":"Unprocessable Entity"}')
-        );
-
-        /** @And a logger that expects info for request and error for response */
-        $logger = $this->createMock(LoggerInterface::class);
-
-        $logger->expects(self::once())
-            ->method('info')
-            ->with('request');
-
-        $logger->expects(self::once())
-            ->method('error')
-            ->with(
-                'response',
-                self::callback(function (array $context): bool {
-                    return $context['status_code'] === 422;
-                })
-            );
-
-        /** @And a middleware configured with the logger */
-        $middleware = LogMiddleware::create()->withLogger(logger: $logger)->build();
-
-        /** @When the middleware processes the request */
-        $actual = $middleware->process($request, $handler);
-
-        /** @Then the response should be returned with status 422 */
-        self::assertSame(422, $actual->getStatusCode());
-    }
-
     public function testLogsErrorLevelOnServerErrorResponse(): void
     {
         /** @Given a DELETE request */
@@ -482,6 +446,44 @@ final class LogMiddlewareTest extends TestCase
 
         /** @When attempting to build the middleware */
         $builder->build();
+    }
+
+    public function testLogsWarningLevelOnClientErrorResponse(): void
+    {
+        /** @Given a POST request */
+        $request = new ServerRequest('POST', '/users');
+
+        /** @And a handler that returns a 422 response */
+        $handler = new CapturingHandler(
+            response: new Response(422, [], '{"error":"Unprocessable Entity"}')
+        );
+
+        /** @And a logger that expects info for request, warning for response, and no error */
+        $logger = $this->createMock(LoggerInterface::class);
+
+        $logger->expects(self::once())
+            ->method('info')
+            ->with('request');
+
+        $logger->expects(self::once())
+            ->method('warning')
+            ->with(
+                'response',
+                self::callback(function (array $context): bool {
+                    return $context['status_code'] === 422;
+                })
+            );
+
+        $logger->expects(self::never())->method('error');
+
+        /** @And a middleware configured with the logger */
+        $middleware = LogMiddleware::create()->withLogger(logger: $logger)->build();
+
+        /** @When the middleware processes the request */
+        $actual = $middleware->process($request, $handler);
+
+        /** @Then the response should be returned with status 422 */
+        self::assertSame(422, $actual->getStatusCode());
     }
 
     #[DataProvider('anyStatusDataProvider')]
@@ -1057,6 +1059,30 @@ final class LogMiddlewareTest extends TestCase
         );
     }
 
+    #[DataProvider('responseLevelDataProvider')]
+    public function testResponseWhenStatusCodeIsInRangeThenLoggedAtLevelOfThatRange(
+        int $statusCode,
+        string $level
+    ): void {
+        /** @Given a GET request */
+        $request = new ServerRequest('GET', '/v1/orders');
+
+        /** @And a handler that answers with the status code of the data set */
+        $handler = new CapturingHandler(response: new Response($statusCode));
+
+        /** @And a logger that captures every entry */
+        $logger = new CapturingLogger();
+
+        /** @And a middleware configured with the logger */
+        $middleware = LogMiddleware::create()->withLogger(logger: $logger)->build();
+
+        /** @When the middleware processes the request */
+        $middleware->process($request, $handler);
+
+        /** @Then the request entry is logged at info and the response entry at the level of the status range */
+        self::assertSame(['info', $level], array_column($logger->entries(), 'level'));
+    }
+
     public function testBuildWhenOnlyClockAndLoggerAreGivenThenEveryExchangeIsLogged(): void
     {
         /** @Given a health check request */
@@ -1157,8 +1183,10 @@ final class LogMiddlewareTest extends TestCase
     }
 
     #[DataProvider('errorStatusDataProvider')]
-    public function testFailureOnlyPathWhenResponseFailsThenRequestAndResponseAreLogged(int $statusCode): void
-    {
+    public function testFailureOnlyPathWhenResponseFailsThenRequestAndResponseAreLogged(
+        int $statusCode,
+        string $level
+    ): void {
         /** @Given a request to a periodic sweep route carrying query parameters and a body */
         $request = new ServerRequest('POST', '/v1/outbox/dispatches?batch=10')
             ->withQueryParams(['batch' => '10'])
@@ -1180,7 +1208,7 @@ final class LogMiddlewareTest extends TestCase
         /** @When the middleware processes the request */
         $middleware->process($request, $handler);
 
-        /** @Then the request entry and the response entry are written with the context any other path gets */
+        /** @Then the request entry and the response entry are written with the context and level any other path gets */
         self::assertSame(
             [
                 [
@@ -1194,7 +1222,7 @@ final class LogMiddlewareTest extends TestCase
                     ]
                 ],
                 [
-                    'level'   => 'error',
+                    'level'   => $level,
                     'message' => 'response',
                     'context' => [
                         'method'      => 'POST',
@@ -1304,11 +1332,12 @@ final class LogMiddlewareTest extends TestCase
     public static function errorStatusDataProvider(): array
     {
         return [
-            'Bad request'           => [400],
-            'Not found'             => [404],
-            'Unprocessable entity'  => [422],
-            'Internal server error' => [500],
-            'Service unavailable'   => [503]
+            'Bad request'           => [400, 'warning'],
+            'Not found'             => [404, 'warning'],
+            'Unprocessable entity'  => [422, 'warning'],
+            'Highest client error'  => [499, 'warning'],
+            'Internal server error' => [500, 'error'],
+            'Service unavailable'   => [503, 'error']
         ];
     }
 
@@ -1401,13 +1430,31 @@ final class LogMiddlewareTest extends TestCase
         ];
     }
 
+    public static function responseLevelDataProvider(): array
+    {
+        return [
+            'OK'                            => [200, 'info'],
+            'Found'                         => [302, 'info'],
+            'Highest redirection'           => [399, 'info'],
+            'Bad request'                   => [400, 'warning'],
+            'Unauthorized'                  => [401, 'warning'],
+            'Not found'                     => [404, 'warning'],
+            'Unprocessable entity'          => [422, 'warning'],
+            'Highest client error'          => [499, 'warning'],
+            'Internal server error'         => [500, 'error'],
+            'Service unavailable'           => [503, 'error'],
+            'Network authentication needed' => [511, 'error']
+        ];
+    }
+
     public static function nonErrorStatusDataProvider(): array
     {
         return [
-            'OK'         => [200],
-            'Created'    => [201],
-            'No content' => [204],
-            'Found'      => [302]
+            'OK'                  => [200],
+            'Created'             => [201],
+            'No content'          => [204],
+            'Found'               => [302],
+            'Highest redirection' => [399]
         ];
     }
 
@@ -1415,6 +1462,7 @@ final class LogMiddlewareTest extends TestCase
     {
         return [
             'Successful response' => [200, 'info'],
+            'Client error'        => [422, 'warning'],
             'Server error'        => [500, 'error']
         ];
     }
