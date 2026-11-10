@@ -18,11 +18,13 @@
 
 Provides a PSR-15 middleware that records every inbound HTTP exchange. Before invoking the next handler, the
 middleware logs the request method, URI, query parameters, and parsed body. After the handler runs, it logs the
-response status code, decoded JSON body when present, and the elapsed duration in milliseconds. Successful
-responses are logged at `info` level. Responses in the 4xx/5xx range are logged at `error` level. Chosen paths can be
-left out of the log entirely, or logged only when their response is an error, so health checks and routes called on
-a schedule do not bury the entries that matter. A body longer than 2048 bytes is logged as an excerpt that fits within
-that limit, so a single entry stays well under the line length a log driver accepts.
+response status code, decoded JSON body when present, and the elapsed duration in milliseconds. Responses in the
+5xx range are logged at `error` level, responses in the 4xx range at `warning` level, and every other response at
+`info` level, so a client mistake (a wrong password, a failed validation, an unknown resource) does not reach the
+alerts that watch the `error` level. Chosen paths can be left out of the log entirely, or logged only when their
+response is an error, so health checks and routes called on a schedule do not bury the entries that matter. A body
+longer than 2048 bytes is logged as an excerpt that fits within that limit, so a single entry stays well under the
+line length a log driver accepts.
 
 Duration is measured through a `TinyBlocks\Time\MonotonicClock` and a `Stopwatch`, so the reading is unaffected
 by wall-clock adjustments. When the request carries a correlation identifier (under the `correlationId`
